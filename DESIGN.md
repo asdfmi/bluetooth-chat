@@ -1,146 +1,147 @@
-設計書: Linux間 Bluetooth SPP 1対1チャット (Go, D-Bus, /dev/rfcomm 不使用)
+Design Document: Bluetooth SPP 1-to-1 Chat Between Linux Hosts (Go, D-Bus, No /dev/rfcomm)
 
-1. ゴール
-  - BlueZ を用い、RFCOMM(Serial Port Profile; UUID: 00001101-0000-1000-8000-00805f9b34fb) で 1対1チャット。
-  - サーバ: BlueZ ProfileManager1 に SPP を登録し、Profile1.NewConnection で受け取る UnixFD を直接 read/write。
-  - クライアント: MAC アドレスは未知。D-Bus で発見・ペアリング・接続を行い、Profile1.NewConnection で受け取る UnixFD を直接 read/write。
-  - /dev/rfcommX は登場させない（FD直扱い）。
+1. Goal
+  - Implement a 1-to-1 chat using BlueZ and RFCOMM (Serial Port Profile; UUID: 00001101-0000-1000-8000-00805f9b34fb).
+  - Server: Register SPP via BlueZ ProfileManager1, handle UnixFD from Profile1.NewConnection directly with read/write.
+  - Client: MAC address is unknown. Discover, pair, and connect via D-Bus, handle UnixFD from Profile1.NewConnection directly with read/write.
+  - /dev/rfcommX will not be used (FD handled directly).
 
-2. モジュール構成
-  A. ConnectionManager（接続制御; 低層）
+2. Module Structure
+  A. ConnectionManager (Connection Control; Low Layer)
      - Server:
-       - D-Bus(org.bluez.ProfileManager1, Profile1) で SPP を Role="server" + 固定チャネル=22 で公開。
-       - SPP サービス名（service name）を ProfileManager1.RegisterProfile の options["Name"] に設定。
-         （この値はリモート側のSDPで参照可能。クライアントは一覧表示に利用。）
-       - 接続成立時に Profile1.NewConnection(fd) を受領し、fd を上位(B)へ引き渡す。
+       - Expose SPP via D-Bus (org.bluez.ProfileManager1, Profile1) as Role="server" + fixed channel=22.
+       - Set SPP service name in options["Name"] of ProfileManager1.RegisterProfile.
+         (This value is referenced in the remote SDP and listed by clients.)
+       - Upon connection, receive Profile1.NewConnection(fd) and pass fd to upper layer (B).
      - Client:
-       - D-Bus で周辺デバイスを発見(Adapter1.StartDiscovery + ObjectManager/InterfacesAdded)し、Device1.UUIDs に SPP UUID を含むものを抽出。
-       - 必要に Device1.Pair()、続けて Device1.ConnectProfile(SPP_UUID) を呼ぶ。
-       - スキャン時のデバイス一覧は「SPPサービス名（SDPのServiceName属性; サーバの RegisterProfile options["Name"]）を優先表示」。
-         取得できない場合は Device1.Alias/Name を代替表示。併せて MAC も表示。
-         ユーザが手動で選択（choose）したデバイスに対してのみ Pair/Connect を実施。
-       - 自プロセスにも Profile1 を Role="client" で登録し、接続成立時の Profile1.NewConnection(fd) を受領して上位(B)へ渡す。
-     - 責務: 「FDを準備して渡す」まで。再接続は本MVPでは行わない。
-  B. Transport（バイトストリームI/O）
-     - 標準パッケージ（os/io）のみで、受け取った FD を os.NewFile で *os.File にラップし Read/Write/Close を提供。I/O は goroutine + ブロッキングで実装。
-  C. Framing（メッセージ化）
-     - LF改行区切りで bytes⇆string。
-  D. CLI/App（UI最小）
-     - 引数: `-role (server|client)`, `-name <service-name>`。
-       - server: `-name` は必須（SPPサービス名）。RegisterProfile options["Name"] に設定。
-       - client: `-name` は使用しない（自動選択は行わない）。
-     - クライアントは「scan → 一覧表示 → ユーザが番号で choose → 接続」というフローのみを提供。
-     - スキャン一覧は「SPPサービス名（SDP; RegisterProfile options["Name"]）優先 + MAC」を列挙（取得不能時は Alias/Name）。
-     - stdin 行→C.Encode→B.Write、B.Read→C.Feed→表示。
+       - Discover nearby devices via D-Bus (Adapter1.StartDiscovery + ObjectManager/InterfacesAdded), filter those whose Device1.UUIDs include SPP UUID.
+       - Call Device1.Pair() if needed, then Device1.ConnectProfile(SPP_UUID).
+       - During scan, prioritize displaying the SPP service name (SDP ServiceName; server’s RegisterProfile options["Name"]).
+         If unavailable, use Device1.Alias/Name as fallback. Display MAC alongside.
+         Only the user-selected device is paired/connected.
+       - Register Profile1 with Role="client" to receive Profile1.NewConnection(fd) and pass fd to upper layer (B).
+     - Responsibility: Prepare and hand over FD. Reconnection is not implemented in this MVP.
+  B. Transport (Byte Stream I/O)
+     - Use only standard packages (os/io). Wrap received FD via os.NewFile into *os.File, providing Read/Write/Close.
+       I/O implemented with goroutines and blocking operations.
+  C. Framing (Message Handling)
+     - LF-delimited conversion between bytes and string.
+  D. CLI/App (Minimal UI)
+     - Args: `-role (server|client)`, `-name <service-name>`.
+       - server: `-name` is mandatory (SPP service name), set to RegisterProfile options["Name"].
+       - client: `-name` unused (no auto-selection).
+     - Client flow: “scan → list → user choose → connect”.
+     - Scan list shows “SPP service name (SDP; RegisterProfile options["Name"]) + MAC” (fallback to Alias/Name if unavailable).
+     - stdin line → C.Encode → B.Write, B.Read → C.Feed → display.
 
-3. 依存/使用API
+3. Dependencies / APIs
   - dbus: github.com/godbus/dbus/v5
 
-4. データパス（送信時）
-  App.Write → Transport.Write(*os.File.Write) → カーネル RFCOMM(フレーミング/クレジット制御)
-             → L2CAP(多重化/分割再結合) → HCI(ACLデータ化) → BTコントローラ → 無線
-  受信は逆順。D-Bus は制御面のみ（FD受け渡し）でデータ面には登場しない。
+4. Data Path (Transmit)
+  App.Write → Transport.Write(*os.File.Write) → Kernel RFCOMM (framing/credit control)
+             → L2CAP (multiplexing/reassembly) → HCI (ACL encapsulation) → BT Controller → Air
+  Reception is the reverse. D-Bus is only used for control (FD passing), not for data transfer.
 
-5. シーケンス概要
+5. Sequence Overview
   5.1 Server
     main → A.StartListen(serviceName)
-      ├─ D-Bus: Profile1 を自プロセスに Export(Role="server")
+      ├─ D-Bus: Export Profile1 (Role="server")
       ├─ D-Bus: ProfileManager1.RegisterProfile(obj, SPP_UUID, {"Role":"server","Channel":22,"Name":serviceName})
-      └─ 接続待機 → D-Bus: Profile1.NewConnection(dev, fd, props)
-           ├─ A: fd を受領 → B.OpenFromFD(fd)
-           └─ D: goroutineで B.Read ループ開始
+      └─ Wait for connection → D-Bus: Profile1.NewConnection(dev, fd, props)
+           ├─ A: receive fd → B.OpenFromFD(fd)
+           └─ D: start goroutine for B.Read loop
   5.2 Client
-    main → A.ScanSPP(SPP_UUID) → 一覧表示（SPPサービス名優先） → ユーザが1台を選択
+    main → A.ScanSPP(SPP_UUID) → display list (SPP service name prioritized) → user selects device
       ├─ D-Bus: Adapter1.StartDiscovery()
-      ├─ D-Bus: InterfacesAdded を購読し、Device1.UUIDs に SPP_UUID を含むデバイスを列挙
-      ├─ （表示用）各デバイスに対し Device1.DiscoverServices(SPP_UUID) を行い、SDP ServiceName(0x0100) を取得
-      ├─ 取得できない場合は Device1.Alias/Name を表示名として利用。MAC も併記
-      ├─ ユーザの選択結果（devicePath）を取得
-      ├─ D-Bus: （未ペア時のみ）Device1.Pair()
+      ├─ D-Bus: Listen for InterfacesAdded, list devices with SPP_UUID in Device1.UUIDs
+      ├─ For display: call Device1.DiscoverServices(SPP_UUID) to get SDP ServiceName (0x0100)
+      ├─ If unavailable, use Device1.Alias/Name as display name, append MAC
+      ├─ Get selected devicePath
+      ├─ D-Bus: Device1.Pair() (if not paired)
       ├─ D-Bus: Device1.ConnectProfile(SPP_UUID)
-      ├─ D-Bus: 自プロセス側の Profile1(Role="client") に NewConnection(fd) が飛ぶ
-      └─ A: fd 受領 → B.OpenFromFD(fd)
+      ├─ D-Bus: Receive Profile1.NewConnection(fd) on client Profile1(Role="client")
+      └─ A: receive fd → B.OpenFromFD(fd)
 
-6. 代表エラーハンドリング（MVP最小）
-  - B.Write: 書き込みエラー（相手切断等）→ 終了。
-  - B.Read: n==0/エラー（EOF/切断）→ 終了。
-  - A.RegisterProfile / NewConnection: D-Bus エラーは即時失敗として上位へ返す。
+6. Representative Error Handling (MVP Minimal)
+  - B.Write: On write error (peer disconnect, etc.) → exit.
+  - B.Read: n==0 or error (EOF/disconnect) → exit.
+  - A.RegisterProfile / NewConnection: D-Bus error → fail immediately and return to upper layer.
   - A.DiscoverAndConnect:
-    - Discovery タイムアウト → エラー返却。
-    - Pair 失敗/拒否 → エラー返却。
-    - ConnectProfile 失敗 → エラー返却。
+    - Discovery timeout → return error.
+    - Pair failure/rejection → return error.
+    - ConnectProfile failure → return error.
 
-7. ビルド/実行例（要点）
-  - 前提: Linux, BlueZ 稼働, System bus へアクセス可（必要なら root）。
-  - サーバ: ./chat -role=server -name="MyChatService"
-  - クライアント: ./chat -role=client  （起動後、一覧から番号を選択して接続）
-  - 双方で標準入力に文字を打てば相互表示。
+7. Build / Run Examples (Key Points)
+  - Requirements: Linux, BlueZ running, access to system bus (root if needed).
+  - Server: ./chat -role=server -name="MyChatService"
+  - Client: ./chat -role=client  (after launch, select device from list to connect)
+  - Typing text on either terminal shows it on the other.
 
-8. 要点
-  - クライアントは MAC 未知。Discovery + ConnectProfile + Profile1.NewConnection で FD を取得。
-  - サーバ/クライアントとも /dev/rfcommX は使わず、**FD直I/O**。
-  - A が FD を用意し、B が FD を I/O、C/D は上位ロジックのみ。
-  - サーバは `-name`（SPPサービス名）必須。RegisterProfile options["Name"] に設定し、クライアントのスキャン一覧で表示名として利用。
-  - クライアントは scan→choose のみ。自動選択や名前フィルタは行わない。
-  - RFCOMMチャネルは 22 に固定（サーバの RegisterProfile options["Channel"] に設定）。
+8. Key Points
+  - Client’s MAC is unknown. Use Discovery + ConnectProfile + Profile1.NewConnection to get FD.
+  - Both server and client avoid /dev/rfcommX; **direct FD I/O** is used.
+  - A prepares FD, B handles I/O, C/D handle higher-level logic.
+  - Server requires `-name` (SPP service name). Set to RegisterProfile options["Name"], used as display name by client.
+  - Client only performs scan→choose; no auto-selection or name filtering.
+  - RFCOMM channel fixed to 22 (set in server’s RegisterProfile options["Channel"]).
 
-9. 動作確認（モジュール別）
-  9.1 A: ConnectionManager（接続制御; D-Bus）
-    Server 側:
-      手順:
-        - BlueZ/System bus へアクセス可能なユーザで起動: `./chat -role=server -name="MyChatService"`。
-        - SDP登録確認: 同一ホストまたは別ホストから `sdptool browse <server-mac|local>` を実行し、SPP(Serial Port)エントリの Service Name と RFCOMM Channel を確認。
-        - 接続確認: 別ホストのクライアントから接続（9.4 参照）。同時に `dbus-monitor --system "type='method_call',interface='org.bluez.Profile1',member='NewConnection'"` を実行し、呼び出し到来を確認。
-      期待結果:
-        - RegisterProfile が成功し、SDPに「Service Name: MyChatService」「Channel: 22」が表示される。
-        - クライアント接続時に Profile1.NewConnection が呼ばれ、UnixFD を1本受領できる。
-        - 切断時、以降の Read は EOF、Write はエラーとなる。
+9. Verification (By Module)
+  9.1 A: ConnectionManager (Connection Control; D-Bus)
+    Server Side:
+      Steps:
+        - Run as user with BlueZ/system bus access: `./chat -role=server -name="MyChatService"`.
+        - Verify SDP registration: run `sdptool browse <server-mac|local>` and confirm “Service Name: MyChatService” and “Channel: 22”.
+        - Verify connection: connect from client (see 9.4) and monitor `dbus-monitor --system "type='method_call',interface='org.bluez.Profile1',member='NewConnection'"`.
+      Expected:
+        - RegisterProfile succeeds; SDP shows “Service Name: MyChatService”, “Channel: 22”.
+        - On client connect, Profile1.NewConnection is invoked, one UnixFD received.
+        - After disconnect, subsequent Read gives EOF, Write returns error.
 
-    Client 側:
-      手順:
-        - 起動: `./chat -role=client`。
-        - 発見確認: `dbus-monitor --system "type='signal',interface='org.freedesktop.DBus.ObjectManager',member='InterfacesAdded'"` を併用し、SPP UUID を含むデバイスが検出されることを確認。
-        - 一覧から1台を選択。未ペアの場合は Pair プロンプト（OS/UI）が表示される場合があるので承認。
-        - 接続成立時、自プロセスの Profile1(Role="client") に対して `NewConnection` が飛ぶことを `dbus-monitor` で確認。
-      期待結果:
-        - 一覧には SPP(UUID: 00001101-0000-1000-8000-00805f9b34fb) を持つデバイスのみが並ぶ。
-        - 表示名は可能なら SDPのServiceName（例: MyChatService）を使用。取得不能時は Alias/Name。MAC も併記。
-        - 選択後、未ペアなら Pair が成功し、その後 ConnectProfile が成功。続いて自プロセスの Profile1 に NewConnection が到来し、UnixFD を受領する。
-        - Discovery は選択操作で停止。タイムアウト時は明確なエラーで終了。
+    Client Side:
+      Steps:
+        - Run: `./chat -role=client`.
+        - Verify discovery: monitor `dbus-monitor --system "type='signal',interface='org.freedesktop.DBus.ObjectManager',member='InterfacesAdded'"`, confirm detection of devices with SPP UUID.
+        - Choose one from list. If unpaired, pairing prompt (OS/UI) may appear; approve it.
+        - On connection success, verify `Profile1.NewConnection` invoked on client’s Profile1(Role="client").
+      Expected:
+        - List shows only devices with SPP (UUID: 00001101-0000-1000-8000-00805f9b34fb).
+        - Display name is SDP ServiceName (e.g. MyChatService) if available; otherwise Alias/Name. MAC always shown.
+        - After selection, Pair succeeds (if needed), ConnectProfile succeeds, and client’s Profile1 receives NewConnection with UnixFD.
+        - Discovery stops after selection. Timeout triggers clear error and exit.
 
-  9.2 B: Transport（バイトストリームI/O）
-    手順（単体）:
-      - （x/sys/unix 非使用のため）ユニット検証は以下のいずれかで代替:
-        - `net.Pipe()` を用いて Read/Write/Close の往復挙動を確認（FD 不要）。
-        - もしくは `os.Pipe()` を2本用いて相互接続し、片側クローズ時に B.Read が EOF、B.Write がエラーとなることを確認。
-      手順（結合: A+B）:
-      - A 経由で FD を取得（サーバ/クライアント接続完了後）。通常どおり標準入力から送受信し、B が問題なく I/O できることを確認。
-    期待結果:
-      - Write は送信バイト数を返し、Read は到着バイトをそのまま返す（改行等の加工なし）。
-      - ピア Close で Read は 0/EOF、以降の Write はエラーとなり、アプリは終了。
+  9.2 B: Transport (Byte Stream I/O)
+    Unit Test:
+      - (Without x/sys/unix) verify using:
+        - `net.Pipe()` to test Read/Write/Close behavior.
+        - Or connect two `os.Pipe()` pairs and verify EOF on close, Write returns error after peer close.
+      Integration (A+B):
+      - Obtain FD from A (after connection). Verify normal I/O between peers via stdin.
+    Expected:
+      - Write returns number of bytes sent, Read returns received bytes unchanged.
+      - When peer closes, Read gives 0/EOF, subsequent Write errors, app exits.
 
-  9.3 C: Framing（メッセージ化）
-    手順:
-      - Encode: 入力 "abc" → 出力 "abc\n"。空文字列 "" → "\n"。
-      - Decode: 入力ストリーム "a\nb\n\nc" を順に Feed し、"a", "b", "" の3メッセージを取り出せること。末尾の "c" は次の LF が来るまで保留されること。
-      - 改行系: 送信は LF のみ付与。受信は LF 区切りを前提（CRLF は MVP では未サポート扱い。必要なら上位で CR 除去）。
-    期待結果:
-      - エンコードは常に末尾に LF を1つだけ追加し、内部でエスケープは行わない。
-      - デコードは LF を区切りとして分割。部分行は次の入力まで保持し、LF を含む長文も問題なく取り扱える。
+  9.3 C: Framing (Message Handling)
+    Steps:
+      - Encode: input "abc" → output "abc\n"; empty string "" → "\n".
+      - Decode: input stream "a\nb\n\nc" → messages "a", "b", ""; trailing "c" kept until next LF.
+      - Newline: send LF only; receive expects LF delimiter (CRLF unsupported in MVP; strip CR if needed at upper layer).
+    Expected:
+      - Encoder always appends exactly one LF; no escaping.
+      - Decoder splits by LF, retains partial lines until next input, handles long lines with LF correctly.
 
-  9.4 D: CLI/App（UI最小）
-    手順（E2E）:
-      - 構成: 2台の Linux もしくは 1台 + USB BT ドングルでアダプタを分ける。
-      - サーバ: `./chat -role=server -name="MyChatService"` を実行。
-      - クライアント: `./chat -role=client` を実行し、一覧から "MyChatService <MAC>" を選択。
-      - 接続後、双方端末で1行ずつ文字列を入力し、相手側に即時表示されることを確認。
-      - 切断試験: サーバプロセス終了 or BT オフで、クライアント側が EOF/エラーを検知して終了すること（逆方向も同様）。
-    手順（異常系）:
-      - サーバで `-name` 未指定 → 起動失敗（usage/エラー出力）。
-      - クライアントで選択デバイスが SPP 未提供/到達不可 → ConnectProfile 失敗を表示して終了。
-      - ペアリング拒否 → 明確なエラー表示で終了。
-    期待結果:
-      - サーバは `-name` 必須チェックにより、未指定時は非0終了。
-      - クライアントは自動接続/自動選択を行わず、ユーザ選択時のみ接続。成功時に FD を受領し I/O 開始。
-      - 同時接続は MVP では非対応。既に接続中に2本目が到来した場合、2本目の FD は即時 Close（または拒否）し、既存接続を維持。
-      - 終了時にプロファイル登録解除（UnregisterProfile）および `Profile1.Release` を適切に処理。
+  9.4 D: CLI/App (Minimal UI)
+    Steps (E2E):
+      - Setup: two Linux hosts or single host + USB BT dongle.
+      - Server: `./chat -role=server -name="MyChatService"`.
+      - Client: `./chat -role=client`, select "MyChatService <MAC>".
+      - After connection, both sides can type and immediately see the other’s messages.
+      - Disconnect test: terminate server or turn off BT, client detects EOF/error and exits (and vice versa).
+    Abnormal Cases:
+      - Server without `-name` → startup fails (usage/error message).
+      - Client connecting to device without/invalid SPP → ConnectProfile fails and exits.
+      - Pairing rejected → explicit error message and exit.
+    Expected:
+      - Server enforces mandatory `-name` and exits non-zero if missing.
+      - Client never auto-connects/selects; only user-selected device connects; upon success, FD received and I/O begins.
+      - No multi-connection support in MVP. If second FD arrives, close/reject it and keep existing connection.
+      - On exit, properly unregister profile (UnregisterProfile) and handle `Profile1.Release`.
